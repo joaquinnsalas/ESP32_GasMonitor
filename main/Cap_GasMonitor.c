@@ -3,6 +3,7 @@
 #include <string.h>      // String handling
 #include <math.h>        // Math operations (pow, etc.)
 #include <inttypes.h>    // PRIX32 format specifier
+#include <stdbool.h>
 
 // FreeRTOS Libraries
 #include "freertos/FreeRTOS.h"  
@@ -17,6 +18,9 @@
 #include "esp_log.h"      // Logging
 #include "esp_mac.h"      // MAC address functions
 #include "nvs_flash.h"    // Non-volatile storage
+#include "wifi_provisioning/manager.h"
+#include "wifi_provisioning/scheme_softap.h"
+#include "qrcode.h"
 
 // AWS IoT & MQTT Libraries
 #include "network_transport.h"
@@ -42,6 +46,7 @@
 // Project-Specific Files
 #include "wifi.h"         // Wi-Fi functionality
 #include "sdkconfig.h"    // ESP-IDF Project Configuration
+
 
 void mqtt_process_task(void *arg);
 void set_wifi_status(bool connected);
@@ -181,7 +186,7 @@ void scd41_task(void *pvParameters)
 
         // Update global sensor_readings and convert co2 to float
         xSemaphoreTake(sensor_mutex, portMAX_DELAY);
-        sensor_readings[0] = temp_scd4x;
+        sensor_readings[0] = (temp_scd4x * 9/5) + 32;
         sensor_readings[1] = humidity_scd4x;
         sensor_readings[2] = (float)co2_scd4x;
         scd_updated = true;
@@ -189,7 +194,6 @@ void scd41_task(void *pvParameters)
         xSemaphoreGive(sensor_mutex);
     }
 }
-// ******************************* SCD41 *******************************
 
 // ******************************* AD7718 *******************************
 // Writes one byte to the specified register.
@@ -272,6 +276,38 @@ void ad7718_init_spi(void)
     assert(ret == ESP_OK); // Stop if doesnt work
 }
 
+// Constants for Voltage to PPM
+float ammonia_rl = 10640;
+float h2s_rl = 10490;
+float methane_rl = 10900;
+
+float ammonia_a = 1264.231;
+float h2s_a = 1264.231;
+float methane_a = 17.5198;
+
+float ammonia_b = -4.1325;
+float h2s_b = -4.1325;
+float methane_b = -1.756472;
+
+float ammonia_ro = 10000;
+float h2s_ro = 9968;
+float methane_ro = 9982;
+
+
+static float compute_ppm(float vout, float rl, float ro, float a, float b)
+{
+    // 1) Compute sensor resistance (Rs)
+    float Rs = ((5.0f - (vout * 2)) * ro) / (vout * 2);
+
+    // 2) Ratio relative to "clean air" (Ro)
+    float ratio = Rs / rl;
+
+    // 3) Use the sensor’s power-law curve:  PPM = a * (ratio^b)
+    float ppm = (a * powf(ratio, b));
+
+    return ppm;
+}
+
 void ad7718_task(void *pvParameters)
 {
     // Configure the RESET pin as output and the RDY pin as input.
@@ -288,7 +324,16 @@ void ad7718_task(void *pvParameters)
     ESP_LOGI("AD7718", "AD7718 initialized!");
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    const uint8_t ain_channels[3] = {0x07, 0x17, 0x27};
+    // const uint8_t ain_channels[3] = {0x07, 0x17, 0x27};
+    // BLAKE CHANGED:
+    //  AIN1 --> AIN4
+    // so, heres the new ain_channels based off the assumption:
+    //          AIN1 == 0x07
+    //          AIN1 == 0x17
+    //          AIN1 == 0x27
+    //          AIN1 == 0x37
+
+    const uint8_t ain_channels[3] = {0x37, 0x17, 0x27};
     const char *ain_labels[3] = {"AIN1", "AIN2", "AIN3"};
     float adc_voltages[3] = { 0 };
 
@@ -299,12 +344,12 @@ void ad7718_task(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(200));
 
             (void)ad7718_read(AD7718_DATA_REG); // dummy read to flush out old data
-
             while (gpio_get_level(AD7718_RDY) != 0) { // check if data is ready
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
-
             uint32_t adc_value = ad7718_read(AD7718_DATA_REG);
+
+            // Convert raw ADC value to corrected_voltage
             float voltage = ((((float)adc_value / pow(2, 23)) - 1) * 2.5) + 0.0278177268;
             float corrected_voltage = (voltage - 0.0287) / 0.9758; // linearizing voltage
             adc_voltages[i] = corrected_voltage;
@@ -313,12 +358,24 @@ void ad7718_task(void *pvParameters)
 
         // Update global sensor_readings 3, 4, 5
         xSemaphoreTake(sensor_mutex, portMAX_DELAY);
-        methane = adc_voltages[0];
-        ammonia = adc_voltages[1];
-        h2s = adc_voltages[2];
+
+        // Convert to PPM using the equations
+        //    Order is: AIN1 = ammonia, AIN2 = h2s, AIN3 = methane
+        float v1 = adc_voltages[1]; // ammonia
+        float v2 = adc_voltages[2]; // h2s
+        float v3 = adc_voltages[0]; // methane
+
+        // AIN1 => MQ137 => "ammonia"
+        methane = compute_ppm(v1, ammonia_rl, ammonia_ro, ammonia_a, ammonia_b);
+        // AIN2 => MQ136 => "h2s"
+        ammonia = compute_ppm(v2, h2s_rl, h2s_ro, h2s_a, h2s_b);
+        // AIN3 => MQ4 => "methane"
+        h2s = compute_ppm(v3, methane_rl, methane_ro, methane_a, methane_b);
+
         sensor_readings[3] = methane;
         sensor_readings[4] = ammonia;
         sensor_readings[5] = h2s;
+
         adc_updated = true;
         queue_mqtt_readings();
         xSemaphoreGive(sensor_mutex);
@@ -392,7 +449,7 @@ void mqtt_process_task(void* arg)
         snprintf(mqtt_string, sizeof(mqtt_string), 
                 "{"
                 "\"temperature\":%.2f, \"humidity\":%.2f, \"co2\":%.2f, "
-                "\"AIN1\":%.6f, \"AIN2\":%.6f, \"AIN3\":%.6f"
+                "\"NH3\":%.6f, \"H2S\":%.6f, \"CH4\":%.6f"
                 "}",
                 local_sensor_readings[0], local_sensor_readings[1], local_sensor_readings[2],
                 local_sensor_readings[3], local_sensor_readings[4], local_sensor_readings[5]);
@@ -518,13 +575,8 @@ void app_main() {
         return; // Prevent execution if queues failed
     }
 
-    // Initialize Wi-Fi station mode
-    wifi_init();
-    while (wifi_connect() != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi not available, retrying...");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // NEW STUFF FOR WIFI PROVISIONING //
+    wifi_provisioning_start();
 
     aws_init();
     set_wifi_status(true);
@@ -534,6 +586,4 @@ void app_main() {
 
     xTaskCreatePinnedToCore(ad7718_task, "ad7718_task", 4096, NULL, 3, NULL, 1);
     vTaskDelay(pdMS_TO_TICKS(500));
-
-    // // // xTaskCreatePinnedToCore(mqtt_process_task, "mqtt_process_task", 4096, NULL, 9, &mqtt_task_handle, 1);
 }
