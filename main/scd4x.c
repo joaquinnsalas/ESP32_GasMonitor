@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2021, Sensirion AG
  * Copyright (c) 2021 Ruslan V. Uss <unclerus@gmail.com>
  *
  * Redistribution and use in source and binary forms, with or without
@@ -23,6 +24,19 @@
  * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/**
+ * @file scd4x.c
+ *
+ * ESP-IDF driver for SCD4x CO2 sensor.
+ *
+ * Ported from https://github.com/Sensirion/raspberry-pi-i2c-scd4x
+ *
+ * Copyright (c) 2021, Sensirion AG
+ * Copyright (c) 2021 Ruslan V. Uss <unclerus@gmail.com>
+ *
+ * BSD Licensed as described in the file LICENSE
  */
 
 #include <freertos/FreeRTOS.h>
